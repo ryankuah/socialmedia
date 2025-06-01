@@ -1,0 +1,6 @@
+*.json
+*.png
+*.graphml
+_pycache_/
+.DS_Store
+*.pyc 
