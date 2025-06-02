@@ -1,426 +1,796 @@
-import subprocess
+import requests
 import json
 import networkx as nx
 import datetime
 import time
+import re
 import os
 from collections import defaultdict
-import re
 
 
-def run_truthbrush_command(command_args):
+def call_apify_hashtag_api(api_token, hashtag, max_posts=500, timeout=300):
+    """Call the Apify Truth Social Hashtag Scraper API"""
+    
+    # Prepare the input data
+    input_data = {
+        "hashtag": hashtag,
+        "maxPosts": max_posts,
+        "cleanContent": True,
+        "proxyConfiguration": {
+            "useApifyProxy": True,
+            "apifyProxyGroups": ["RESIDENTIAL"]
+        }
+    }
+    
     try:
-        result = subprocess.run(['truthbrush'] + command_args, capture_output=True, text=True, timeout=120)
+        # Start the actor run
+        response = requests.post(
+            f"https://api.apify.com/v2/acts/muhammetakkurtt~truthsocial-hashtag-scraper/runs?token={api_token}",
+            json=input_data,
+            headers={'Content-Type': 'application/json'},
+            timeout=60
+        )
         
-        if result.returncode != 0:
-            if any(indicator in result.stderr.lower() for indicator in ['rate limit', 'too many requests', 'limit exceeded', '429', 'quota']):
-                return "RATE_LIMITED"
+        if response.status_code != 201:
             return None
         
-        try:
-            return json.loads(result.stdout)
-        except json.JSONDecodeError:
-            fixed_stdout = result.stdout.replace("'", '"').replace(': None,', ': null,').replace(': None}', ': null,').replace(': True,', ': true,').replace(': True}', ': true}').replace(': False,', ': false,').replace(': False}', ': false}')
+        run_info = response.json()
+        run_id = run_info['data']['id']
+        
+        # Wait for the run to complete
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            # Check run status
+            status_response = requests.get(
+                f"https://api.apify.com/v2/actor-runs/{run_id}?token={api_token}",
+                timeout=30
+            )
             
-            try:
-                return json.loads(fixed_stdout)
-            except json.JSONDecodeError:
-                import ast
-                try:
-                    if result.stdout.strip().startswith(('{', '[')):
-                        return ast.literal_eval(result.stdout)
-                except:
-                    pass
-                return None
-            
-    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
-        return None
-
-
-def load_existing_data(filename):
-    """Load existing data from truthsocial.json if it exists"""
-    if os.path.exists(filename):
-        try:
-            with open(filename, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            # Extract all posts from the existing data structure
-            all_posts = []
-            processed_ids = set()
-            
-            if 'users' in data:
-                for username, user_data in data['users'].items():
-                    for post in user_data.get('posts', []):
-                        if post.get('post_id'):
-                            processed_ids.add(post['post_id'])
-                            # Convert back to API format for consistency - PRESERVE ORIGINAL AUTHOR
-                            api_post = {
-                                'id': post['post_id'],
-                                'content': post.get('content', ''),
-                                'created_at': post.get('created_at', ''),
-                                'favourites_count': post.get('likes_count', 0),
-                                'reblogs_count': post.get('reposts_count', 0),
-                                'replies_count': post.get('replies_count', 0),
-                                'in_reply_to_account_id': post.get('replied_to', '').replace('user_', '') if post.get('replied_to') and post.get('replied_to').startswith('user_') else None,
-                                'account': {'username': username}  # FIXED: Use actual username instead of 'placeholder'
-                            }
-                            all_posts.append(api_post)
-            
-            return all_posts, processed_ids, data.get('summary', {})
-        except Exception as e:
-            print(f"Warning: Could not load existing data from {filename}: {e}")
-    
-    return [], set(), {}
-
-
-def get_oldest_post_id(posts):
-    """Get the oldest post ID for backward pagination"""
-    if not posts:
-        return None
-    
-    # Sort by ID (lower IDs are older) and return the smallest
-    post_ids = [post.get('id') for post in posts if post.get('id')]
-    return min(post_ids) if post_ids else None
-
-
-def search_with_pagination(search_term, max_id=None, limit_pages=5):
-    """Search for posts with backward pagination"""
-    all_posts = []
-    current_max_id = max_id
-    
-    for page in range(limit_pages):
-        print(f"DEBUG: Searching '{search_term}' - Page {page + 1}/{limit_pages}" + (f" (max_id: {current_max_id})" if current_max_id else ""))
+            if status_response.status_code == 200:
+                status_data = status_response.json()
+                status = status_data['data']['status']
+                
+                if status == 'SUCCEEDED':
+                    break
+                elif status in ['FAILED', 'ABORTED', 'TIMED-OUT']:
+                    return None
+                
+                # Wait before checking again
+                time.sleep(10)
+            else:
+                time.sleep(10)
         
-        # Build search command
-        search_args = ['search', '--searchtype', 'statuses', search_term]
-        if current_max_id:
-            search_args.extend(['--max-id', str(current_max_id)])
-        
-        posts = run_truthbrush_command(search_args)
-        
-        if posts == "RATE_LIMITED":
-            print(f"RATE LIMITED: Hit rate limit on page {page + 1} for '{search_term}'")
-            break
-        
-        if not posts or not isinstance(posts, list) or len(posts) == 0:
-            print(f"DEBUG: No more posts found for '{search_term}' on page {page + 1}")
-            break
-        
-        print(f"DEBUG: Found {len(posts)} posts on page {page + 1}")
-        all_posts.extend(posts)
-        
-        # Update max_id for next page (use the oldest post ID from current batch)
-        post_ids = [post.get('id') for post in posts if post.get('id')]
-        if post_ids:
-            current_max_id = min(post_ids)
         else:
-            break
+            return None
         
-        # Rate limiting between requests
-        time.sleep(3)
-    
-    return all_posts
+        # Get the results
+        results_response = requests.get(
+            f"https://api.apify.com/v2/datasets/{run_info['data']['defaultDatasetId']}/items?token={api_token}",
+            timeout=60
+        )
+        
+        if results_response.status_code == 200:
+            results = results_response.json()
+            return results
+        else:
+            return None
+            
+    except requests.exceptions.Timeout:
+        return None
+    except Exception as e:
+        return None
 
 
-def main():
-    sFileName = "truthsocial.graphml"
-    user_posts_file = "truthsocial.json"
-    checkpoint_file = "checkpoint.json"
+def call_apify_comment_api(api_token, post_id, max_posts=50, sort_by="trending", timeout=300):
+    """Call the Apify Truth Social Comment Scraper API"""
     
-    # Ukraine conflict hashtags discovered from truthbrush search
-    search_terms = [
-        "UkraineConflict",
-        "RussiaUkraineConflict", 
-        "ukraine",  # Keep the plain word as well
-        "russia",   # Add plain word searches too
-        "putin"     # Add other relevant terms
-    ]
+    # Prepare the input data
+    input_data = {
+        "postId": post_id,
+        "maxPosts": max_posts,
+        "sortBy": sort_by,
+        "cleanContent": True,
+        "proxyConfiguration": {
+            "useApifyProxy": True,
+            "apifyProxyGroups": ["RESIDENTIAL"]
+        }
+    }
     
     try:
-        if subprocess.run(['truthbrush', '--help'], capture_output=True, timeout=10).returncode != 0:
-            print("ERROR: truthbrush command failed. Please ensure truthbrush is installed and working.")
-            return
-    except FileNotFoundError:
-        print("ERROR: truthbrush command not found. Please install truthbrush first.")
-        print("You can install it with: npm install -g truthbrush")
-        return
+        # Start the actor run
+        response = requests.post(
+            f"https://api.apify.com/v2/acts/muhammetakkurtt~truthsocial-comment-scraper/runs?token={api_token}",
+            json=input_data,
+            headers={'Content-Type': 'application/json'},
+            timeout=60
+        )
+        
+        if response.status_code != 201:
+            return []
+        
+        run_info = response.json()
+        run_id = run_info['data']['id']
+        
+        # Wait for the run to complete
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            # Check run status
+            status_response = requests.get(
+                f"https://api.apify.com/v2/actor-runs/{run_id}?token={api_token}",
+                timeout=30
+            )
+            
+            if status_response.status_code == 200:
+                status_data = status_response.json()
+                status = status_data['data']['status']
+                
+                if status == 'SUCCEEDED':
+                    break
+                elif status in ['FAILED', 'ABORTED', 'TIMED-OUT']:
+                    return []
+                
+                # Wait before checking again
+                time.sleep(5)
+            else:
+                time.sleep(5)
+        
+        else:
+            return []
+        
+        # Get the results
+        results_response = requests.get(
+            f"https://api.apify.com/v2/datasets/{run_info['data']['defaultDatasetId']}/items?token={api_token}",
+            timeout=60
+        )
+        
+        if results_response.status_code == 200:
+            results = results_response.json()
+            return results
+        else:
+            return []
+            
+    except requests.exceptions.Timeout:
+        return []
     except Exception as e:
-        print(f"ERROR: Failed to check truthbrush availability: {e}")
-        return
-    
-    # Load existing data
-    print("Loading existing data...")
-    existing_posts, processed_post_ids, existing_summary = load_existing_data(user_posts_file)
-    print(f"Loaded {len(existing_posts)} existing posts with {len(processed_post_ids)} processed IDs")
-    
-    # Initialize data structures
-    graph = nx.DiGraph()
-    user_data = defaultdict(lambda: {'posts': [], 'total_posts': 0, 'total_interactions': 0, 'replies_made': 0, 'replies_received': 0})
-    all_posts_with_replies = existing_posts.copy()
-    
-    # Load checkpoint if exists
-    checkpoint_data = {}
-    if os.path.exists(checkpoint_file):
-        try:
-            with open(checkpoint_file, 'r', encoding='utf-8') as f:
-                checkpoint_data = json.load(f)
-            print(f"Loaded checkpoint: {checkpoint_data.get('current_phase', 'unknown phase')}")
-        except Exception as e:
-            print(f"Warning: Could not load checkpoint: {e}")
-    
-    # Determine what phase we're in
-    current_phase = checkpoint_data.get('current_phase', 'search_recent')
-    current_term_index = checkpoint_data.get('current_term_index', 0)
-    
-    # Phase 1: Search recent posts for each term
-    if current_phase == 'search_recent':
-        print("=== PHASE 1: Searching recent posts for Ukraine conflict hashtags ===")
-        
-        for i, search_term in enumerate(search_terms[current_term_index:], start=current_term_index):
-            print(f"\nSearching recent posts for: '{search_term}' ({i+1}/{len(search_terms)})")
-            
-            posts = search_with_pagination(search_term, max_id=None, limit_pages=3)
-            
-            if posts == "RATE_LIMITED":
-                print(f"RATE LIMITED: Saving checkpoint at term {i}")
-                checkpoint_data = {
-                    'timestamp': datetime.datetime.now().isoformat(),
-                    'current_phase': 'search_recent',
-                    'current_term_index': i,
-                    'processed_post_ids': list(processed_post_ids),
-                    'collected_posts': len(all_posts_with_replies),
-                    'message': f'Rate limited while searching recent posts for "{search_term}"'
-                }
-                with open(checkpoint_file, 'w', encoding='utf-8') as f:
-                    json.dump(checkpoint_data, f, indent=2, ensure_ascii=False)
-                print(f"Checkpoint saved. Run script again to resume.")
-                return
-            
-            # Filter out already processed posts
-            new_posts = [post for post in posts if post.get('id') and post.get('id') not in processed_post_ids]
-            print(f"Found {len(new_posts)} new posts for '{search_term}'")
-            
-            all_posts_with_replies.extend(new_posts)
-            for post in new_posts:
-                processed_post_ids.add(post.get('id'))
-        
-        # Move to next phase
-        current_phase = 'search_historical'
-        current_term_index = 0
-        
-        # Save intermediate progress after Phase 1
-        print(f"\n=== SAVING INTERMEDIATE PROGRESS AFTER PHASE 1 ===")
-        print(f"Collected {len(all_posts_with_replies)} posts so far")
-        
-        # Process all collected posts to build graph and user data for intermediate save
-        temp_graph = nx.DiGraph()
-        temp_user_data = defaultdict(lambda: {'posts': [], 'total_posts': 0, 'total_interactions': 0, 'replies_made': 0, 'replies_received': 0})
-        
-        for post in all_posts_with_replies:
-            author = (post.get('account', {}).get('username') or 
-                      post.get('username') or 
-                      f"user_{post.get('account_id', 'unknown')}")
-            
-            replied_to_user = f"user_{post['in_reply_to_account_id']}" if post.get('in_reply_to_account_id') else None
-            content = post.get('content', '') or post.get('text', '')
-            interactions = post.get('favourites_count', 0) + post.get('reblogs_count', 0) + post.get('replies_count', 0)
-            
-            temp_user_data[author]['posts'].append({
-                'content': post.get('content', ''),
-                'created_at': post.get('created_at', ''),
-                'likes_count': post.get('favourites_count', 0),
-                'reposts_count': post.get('reblogs_count', 0),
-                'replies_count': post.get('replies_count', 0),
-                'is_reply': replied_to_user is not None,
-                'replied_to': replied_to_user,
-                'post_id': post.get('id')
-            })
-            temp_user_data[author]['total_posts'] += 1
-            temp_user_data[author]['total_interactions'] += interactions
-        
-        # Save intermediate results
-        temp_data_dict = dict(temp_user_data)
-        intermediate_summary = {
-            'search_terms': search_terms,
-            'total_users': len(temp_data_dict),
-            'total_posts': sum(user['total_posts'] for user in temp_data_dict.values()),
-            'total_interactions': sum(user['total_interactions'] for user in temp_data_dict.values()),
-            'collection_date': datetime.datetime.now().isoformat(),
-            'data_collection_method': 'comprehensive_multi_hashtag_search',
-            'total_posts_collected': len(all_posts_with_replies),
-            'unique_post_ids': len(processed_post_ids),
-            'phase_completed': 'recent_posts_search'
-        }
-        
-        intermediate_data = {
-            'summary': intermediate_summary,
-            'users': temp_data_dict
-        }
-        
-        # Save intermediate file
-        intermediate_file = "truthsocial_intermediate.json"
-        with open(intermediate_file, "w", encoding="utf-8") as json_file:
-            json.dump(intermediate_data, json_file, indent=2, ensure_ascii=False)
-        
-        print(f"Intermediate progress saved to {intermediate_file}")
+        return []
 
-    # Phase 2: Search historical posts (backward pagination)
-    if current_phase == 'search_historical':
-        print("\n=== PHASE 2: Searching historical posts for Ukraine conflict hashtags ===")
-        
-        # Get the oldest post ID from our current data for backward pagination
-        oldest_id = get_oldest_post_id(all_posts_with_replies)
-        print(f"Using oldest post ID for historical search: {oldest_id}")
-        
-        for i, search_term in enumerate(search_terms[current_term_index:], start=current_term_index):
-            print(f"\nSearching historical posts for: '{search_term}' ({i+1}/{len(search_terms)})")
-            
-            posts = search_with_pagination(search_term, max_id=oldest_id, limit_pages=5)
-            
-            if posts == "RATE_LIMITED":
-                print(f"RATE LIMITED: Saving checkpoint at term {i}")
-                checkpoint_data = {
-                    'timestamp': datetime.datetime.now().isoformat(),
-                    'current_phase': 'search_historical',
-                    'current_term_index': i,
-                    'processed_post_ids': list(processed_post_ids),
-                    'collected_posts': len(all_posts_with_replies),
-                    'message': f'Rate limited while searching historical posts for "{search_term}"'
-                }
-                with open(checkpoint_file, 'w', encoding='utf-8') as f:
-                    json.dump(checkpoint_data, f, indent=2, ensure_ascii=False)
-                print(f"Checkpoint saved. Run script again to resume.")
-                return
-            
-            # Filter out already processed posts
-            new_posts = [post for post in posts if post.get('id') and post.get('id') not in processed_post_ids]
-            print(f"Found {len(new_posts)} new historical posts for '{search_term}'")
-            
-            all_posts_with_replies.extend(new_posts)
-            for post in new_posts:
-                processed_post_ids.add(post.get('id'))
-        
-        # Move to next phase
-        current_phase = 'process_final_data'  # Skip comments for now
+
+def extract_author_name(post):
+    """Extract consistent author name from post"""
+    # Try multiple ways to get the username
+    username = (post.get('account', {}).get('username') or 
+                post.get('username') or 
+                post.get('author', {}).get('username'))
     
-    # Phase 3: Collect comments for posts that don't have them yet (OPTIONAL)
-    if current_phase == 'collect_comments':
-        print("\n=== PHASE 3: Collecting comments (OPTIONAL) ===")
-        print("Skipping comment collection to avoid rate limits. Run separately if needed.")
-        current_phase = 'process_final_data'
+    if username:
+        return username
     
-    # Final Phase: Process all data
-    if current_phase == 'process_final_data':
-        print(f"\n=== FINAL PHASE: Processing {len(all_posts_with_replies)} total posts ===")
+    # Fallback to account ID
+    account_id = (post.get('account', {}).get('id') or 
+                  post.get('account_id') or 
+                  post.get('id'))
     
-    print(f"\n=== PROCESSING {len(all_posts_with_replies)} TOTAL POSTS ===")
+    if account_id:
+        return f"user_{account_id}"
     
-    # Process all collected posts to build graph and user data
-    for post in all_posts_with_replies:
-        author = (post.get('account', {}).get('username') or 
-                  post.get('username') or 
-                  f"user_{post.get('account_id', 'unknown')}")
+    return "unknown_user"
+
+
+def extract_replied_to_user(post):
+    """Extract the user being replied to"""
+    replied_to_account_id = post.get('in_reply_to_account_id')
+    if replied_to_account_id:
+        # Try to find the actual username if available in post data
+        if post.get('in_reply_to'):
+            replied_username = extract_author_name(post['in_reply_to'])
+            return replied_username
+        else:
+            # Fallback to user_id format
+            return f"user_{replied_to_account_id}"
+    return None
+
+
+def filter_ukraine_posts(posts):
+    """Filter posts that mention Ukraine or related conflicts"""
+    ukraine_keywords = [
+        'ukraine', 'ukrainian', 'kyiv', 'kiev', 'zelensky', 'putin', 'russia', 'russian',
+        'conflict', 'war', 'invasion', 'nato', 'crimea', 'donbas', 'donetsk', 'luhansk',
+        'sanctions', 'military aid', 'defense', 'battlefield', 'ukraineconflict'
+    ]
+    
+    filtered_posts = []
+    for post in posts:
+        content = (post.get('content', '') or post.get('text', '') or '').lower()
         
-        replied_to_user = f"user_{post['in_reply_to_account_id']}" if post.get('in_reply_to_account_id') else None
+        # Check hashtags as well
+        tags = post.get('tags', [])
+        tag_names = [tag.get('name', '').lower() for tag in tags if isinstance(tag, dict)]
+        all_tags = ' '.join(tag_names)
         
-        content = post.get('content', '') or post.get('text', '')
-        mentions = re.findall(r'@([a-zA-Z0-9_]+)', content) if content else []
+        # Include if content or tags contain keywords, or if it's a substantial post
+        if (any(keyword in content for keyword in ukraine_keywords) or 
+            any(keyword in all_tags for keyword in ukraine_keywords) or 
+            'ukraineconflict' in all_tags or
+            len(content) > 10):  # Include most posts since hashtag search is targeted
+            filtered_posts.append(post)
+    
+    return filtered_posts
+
+
+def process_single_post(post, user_data, graph):
+    """Process a single post and update user_data and graph structures"""
+    author = extract_author_name(post)
+    replied_to_user = extract_replied_to_user(post)
+    content = post.get('content', '') or post.get('text', '')
+    
+    # Extract mentions from content
+    mentions = []
+    if content:
+        # Find @username mentions
+        mentions = re.findall(r'@([a-zA-Z0-9_]+)', content)
+        # Also check mentions array if available
+        if post.get('mentions'):
+            for mention in post.get('mentions', []):
+                if isinstance(mention, dict) and mention.get('username'):
+                    mentions.append(mention['username'])
+    
+    # Extract interaction counts (handle different API formats)
+    likes = post.get('favourites_count', 0) or post.get('likes_count', 0) or 0
+    reblogs = post.get('reblogs_count', 0) or post.get('reposts_count', 0) or 0
+    replies = post.get('replies_count', 0) or 0
+    interactions = likes + reblogs + replies
+    
+    # Ensure all values are integers
+    likes = int(likes) if likes else 0
+    reblogs = int(reblogs) if reblogs else 0
+    replies = int(replies) if replies else 0
+    interactions = int(interactions) if interactions else 0
+    
+    # Update user data
+    user_data[author]['posts'].append({
+        'content': content[:500] if content else "",  # Truncate very long content
+        'created_at': post.get('created_at', ''),
+        'likes_count': likes,
+        'reposts_count': reblogs,
+        'replies_count': replies,
+        'is_reply': replied_to_user is not None,
+        'replied_to': replied_to_user,
+        'post_id': str(post.get('id', '')) or str(post.get('post_id', '')),
+        'url': post.get('url', ''),
+        'tags': [tag.get('name', '') for tag in post.get('tags', []) if isinstance(tag, dict)]
+    })
+    user_data[author]['total_posts'] += 1
+    user_data[author]['total_interactions'] += interactions
+    
+    # Update graph - ensure all node attributes are proper types
+    if not graph.has_node(author):
+        graph.add_node(author, 
+                      post_count=0, 
+                      replies_made=0, 
+                      replies_received=0, 
+                      comments_made=0,
+                      total_interactions=0,
+                      node_type='user')
+    
+    # Update node attributes
+    graph.nodes[author]['post_count'] = graph.nodes[author].get('post_count', 0) + 1
+    graph.nodes[author]['total_interactions'] = graph.nodes[author].get('total_interactions', 0) + interactions
+    
+    # Handle reply relationships
+    if replied_to_user and replied_to_user != author:
+        if not graph.has_node(replied_to_user):
+            graph.add_node(replied_to_user, 
+                          post_count=0, 
+                          replies_made=0, 
+                          replies_received=0, 
+                          comments_made=0,
+                          total_interactions=0,
+                          node_type='user')
         
-        if not graph.has_node(author):
-            graph.add_node(author, post_count=0, replies_made=0, replies_received=0)
+        # Create or update reply edge
+        if graph.has_edge(author, replied_to_user):
+            graph[author][replied_to_user]['reply_count'] = graph[author][replied_to_user].get('reply_count', 0) + 1
+        else:
+            graph.add_edge(author, replied_to_user, 
+                          reply_count=1, 
+                          mention_count=0,
+                          comment_count=0,
+                          interaction_type='reply')
         
-        graph.nodes[author]['post_count'] += 1
+        # Update node counts
+        graph.nodes[author]['replies_made'] = graph.nodes[author].get('replies_made', 0) + 1
+        graph.nodes[replied_to_user]['replies_received'] = graph.nodes[replied_to_user].get('replies_received', 0) + 1
+        user_data[author]['replies_made'] += 1
+        if replied_to_user not in user_data:
+            user_data[replied_to_user] = {'posts': [], 'total_posts': 0, 'total_interactions': 0, 'replies_made': 0, 'replies_received': 0, 'comments_made': 0}
+        user_data[replied_to_user]['replies_received'] += 1
+    
+    # Handle mention relationships
+    for mention in set(mentions):  # Use set to avoid duplicates
+        if mention and mention not in (author, replied_to_user):
+            if not graph.has_node(mention):
+                graph.add_node(mention, 
+                              post_count=0, 
+                              replies_made=0, 
+                              replies_received=0, 
+                              comments_made=0,
+                              total_interactions=0,
+                              node_type='user')
+            
+            # Create or update mention edge
+            if graph.has_edge(author, mention):
+                graph[author][mention]['mention_count'] = graph[author][mention].get('mention_count', 0) + 1
+            else:
+                graph.add_edge(author, mention, 
+                              reply_count=0,
+                              mention_count=1, 
+                              comment_count=0,
+                              interaction_type='mention')
+
+
+def process_comments(comments, user_data, graph):
+    """Process comments and add to network"""
+    comment_count = 0
+    
+    for comment in comments:
+        author = extract_author_name(comment)
+        replied_to_user = extract_replied_to_user(comment)
+        content = comment.get('content', '') or comment.get('text', '')
         
-        interactions = post.get('favourites_count', 0) + post.get('reblogs_count', 0) + post.get('replies_count', 0)
+        # Extract mentions from content
+        mentions = []
+        if content:
+            mentions = re.findall(r'@([a-zA-Z0-9_]+)', content)
+            # Also check mentions array if available
+            if comment.get('mentions'):
+                for mention in comment.get('mentions', []):
+                    if isinstance(mention, dict) and mention.get('username'):
+                        mentions.append(mention['username'])
         
-        user_data[author]['posts'].append({
-            'content': post.get('content', ''),
-            'created_at': post.get('created_at', ''),
-            'likes_count': post.get('favourites_count', 0),
-            'reposts_count': post.get('reblogs_count', 0),
-            'replies_count': post.get('replies_count', 0),
-            'is_reply': replied_to_user is not None,
-            'replied_to': replied_to_user,
-            'post_id': post.get('id')
-        })
-        user_data[author]['total_posts'] += 1
+        # Extract interaction counts
+        likes = int(comment.get('favourites_count', 0) or 0)
+        reblogs = int(comment.get('reblogs_count', 0) or 0)
+        replies = int(comment.get('replies_count', 0) or 0)
+        interactions = likes + reblogs + replies
+        
+        # Initialize user if not exists
+        if author not in user_data:
+            user_data[author] = {'posts': [], 'total_posts': 0, 'total_interactions': 0, 'replies_made': 0, 'replies_received': 0, 'comments_made': 0}
+        
+        # Add comment to user data
+        user_data[author]['comments_made'] += 1
         user_data[author]['total_interactions'] += interactions
         
+        # Update graph
+        if not graph.has_node(author):
+            graph.add_node(author, 
+                          post_count=0, 
+                          replies_made=0, 
+                          replies_received=0, 
+                          comments_made=0,
+                          total_interactions=0,
+                          node_type='user')
+        
+        graph.nodes[author]['comments_made'] = graph.nodes[author].get('comments_made', 0) + 1
+        graph.nodes[author]['total_interactions'] = graph.nodes[author].get('total_interactions', 0) + interactions
+        
+        # Handle comment reply relationships
         if replied_to_user and replied_to_user != author:
             if not graph.has_node(replied_to_user):
-                graph.add_node(replied_to_user, post_count=0, replies_made=0, replies_received=0)
+                graph.add_node(replied_to_user, 
+                              post_count=0, 
+                              replies_made=0, 
+                              replies_received=0, 
+                              comments_made=0,
+                              total_interactions=0,
+                              node_type='user')
             
+            # Create or update comment edge
             if graph.has_edge(author, replied_to_user):
-                graph[author][replied_to_user]['reply_count'] += 1
+                graph[author][replied_to_user]['comment_count'] = graph[author][replied_to_user].get('comment_count', 0) + 1
             else:
-                graph.add_edge(author, replied_to_user, reply_count=1, interaction_type='reply')
+                graph.add_edge(author, replied_to_user, 
+                              reply_count=0,
+                              mention_count=0,
+                              comment_count=1, 
+                              interaction_type='comment')
             
-            graph.nodes[author]['replies_made'] += 1
-            graph.nodes[replied_to_user]['replies_received'] += 1
+            # Update user data
             user_data[author]['replies_made'] += 1
+            if replied_to_user not in user_data:
+                user_data[replied_to_user] = {'posts': [], 'total_posts': 0, 'total_interactions': 0, 'replies_made': 0, 'replies_received': 0, 'comments_made': 0}
             user_data[replied_to_user]['replies_received'] += 1
         
-        for mention in mentions:
-            if mention not in (author, replied_to_user):
+        # Handle mentions in comments
+        for mention in set(mentions):  # Use set to avoid duplicates
+            if mention and mention not in (author, replied_to_user):
                 if not graph.has_node(mention):
-                    graph.add_node(mention, post_count=0, replies_made=0, replies_received=0)
+                    graph.add_node(mention, 
+                                  post_count=0, 
+                                  replies_made=0, 
+                                  replies_received=0, 
+                                  comments_made=0,
+                                  total_interactions=0,
+                                  node_type='user')
                 
+                # Create or update mention edge
                 if graph.has_edge(author, mention):
                     graph[author][mention]['mention_count'] = graph[author][mention].get('mention_count', 0) + 1
                 else:
-                    graph.add_edge(author, mention, mention_count=1, interaction_type='mention')
+                    graph.add_edge(author, mention, 
+                                  reply_count=0,
+                                  mention_count=1,
+                                  comment_count=0,
+                                  interaction_type='mention')
+        
+        comment_count += 1
     
-    # Save network graph
-    nx.write_graphml(graph, sFileName)
-    
-    # Prepare final data
-    user_data_dict = dict(user_data)
-    
+    print(f"✅ Processed {comment_count} comments into network")
+
+
+def generate_summary_stats(user_data_dict, graph, all_posts, all_comments):
+    """Generate summary statistics"""
     reply_edges = sum(1 for _, _, data in graph.edges(data=True) if data.get('interaction_type') == 'reply')
     mention_edges = sum(1 for _, _, data in graph.edges(data=True) if data.get('interaction_type') == 'mention')
+    comment_edges = sum(1 for _, _, data in graph.edges(data=True) if data.get('interaction_type') == 'comment')
     
-    summary_stats = {
-        'search_terms': search_terms,
+    return {
+        'search_method': 'Apify Truth Social Hashtag Scraper - UkraineConflict',
         'total_users': len(user_data_dict),
         'total_posts': sum(user['total_posts'] for user in user_data_dict.values()),
+        'total_comments': len(all_comments),
         'total_interactions': sum(user['total_interactions'] for user in user_data_dict.values()),
         'total_replies_made': sum(user['replies_made'] for user in user_data_dict.values()),
         'total_replies_received': sum(user['replies_received'] for user in user_data_dict.values()),
+        'total_comments_made': sum(user.get('comments_made', 0) for user in user_data_dict.values()),
         'network_nodes': len(graph.nodes()),
         'network_edges': len(graph.edges()),
         'reply_edges': reply_edges,
         'mention_edges': mention_edges,
+        'comment_edges': comment_edges,
         'collection_date': datetime.datetime.now().isoformat(),
-        'data_collection_method': 'comprehensive_multi_term_search_with_pagination',
-        'total_posts_collected': len(all_posts_with_replies),
-        'unique_post_ids': len(processed_post_ids)
+        'data_collection_method': 'apify_truthsocial_hashtag_and_comment_scraper',
+        'total_posts_collected': len(all_posts),
+        'total_comments_collected': len(all_comments)
+    }
+
+
+def main():
+    api_token = os.getenv('APIFY_API_TOKEN')
+    if not api_token:
+        return
+    
+    graph = nx.DiGraph()
+    user_data = defaultdict(lambda: {
+        'posts': [],
+        'total_posts': 0,
+        'total_score': 0,
+        'first_post_date': None,
+        'last_post_date': None
+    })
+    
+    hashtag = "UkraineConflict"
+    
+    # Call Apify hashtag API
+    input_data = {
+        "hashtag": hashtag,
+        "maxPosts": 300,
+        "cleanContent": True,
+        "proxyConfiguration": {
+            "useApifyProxy": True,
+            "apifyProxyGroups": ["RESIDENTIAL"]
+        }
     }
     
-    final_data = {
-        'summary': summary_stats,
-        'users': user_data_dict
-    }
+    try:
+        # Start the actor run
+        response = requests.post(
+            f"https://api.apify.com/v2/acts/muhammetakkurtt~truthsocial-hashtag-scraper/runs?token={api_token}",
+            json=input_data,
+            headers={'Content-Type': 'application/json'},
+            timeout=60
+        )
+        
+        if response.status_code != 201:
+            return
+        
+        run_info = response.json()
+        run_id = run_info['data']['id']
+        
+        # Wait for the run to complete
+        timeout = 600
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            # Check run status
+            status_response = requests.get(
+                f"https://api.apify.com/v2/actor-runs/{run_id}?token={api_token}",
+                timeout=30
+            )
+            
+            if status_response.status_code == 200:
+                status_data = status_response.json()
+                status = status_data['data']['status']
+                
+                if status == 'SUCCEEDED':
+                    break
+                elif status in ['FAILED', 'ABORTED', 'TIMED-OUT']:
+                    return
+                
+                time.sleep(10)
+            else:
+                time.sleep(10)
+        else:
+            return
+        
+        # Get the results
+        results_response = requests.get(
+            f"https://api.apify.com/v2/datasets/{run_info['data']['defaultDatasetId']}/items?token={api_token}",
+            timeout=60
+        )
+        
+        if results_response.status_code == 200:
+            results = results_response.json()
+        else:
+            return
+            
+    except Exception as e:
+        return
     
-    # Save the comprehensive dataset
-    with open(user_posts_file, "w", encoding="utf-8") as json_file:
-        json.dump(final_data, json_file, indent=2, ensure_ascii=False)
+    if not results:
+        return
     
-    # Clean up checkpoint file
-    if os.path.exists(checkpoint_file):
-        os.remove(checkpoint_file)
+    for post in results:
+        # Extract author name
+        username = (post.get('account', {}).get('username') or 
+                   post.get('username') or 
+                   post.get('author', {}).get('username'))
+        
+        if not username:
+            account_id = (post.get('account', {}).get('id') or 
+                         post.get('account_id') or 
+                         post.get('id'))
+            if account_id:
+                username = f"user_{account_id}"
+            else:
+                username = "unknown_user"
+        
+        # Check if valid author
+        if (username and 
+            username != 'None' and 
+            username != '[deleted]' and 
+            username != 'AutoModerator'):
+            
+            # Add or update graph node
+            if username in graph:
+                graph.nodes[username]['subNum'] += 1
+            else:
+                graph.add_node(username, subNum=1)
+            
+            content = post.get('content', '') or post.get('text', '')
+            created_at = post.get('created_at', '')
+            likes = int(post.get('favourites_count', 0) or post.get('likes_count', 0) or 0)
+            
+            # Parse date if available
+            post_date = None
+            if created_at:
+                try:
+                    post_date = datetime.datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                except:
+                    pass
+            
+            # Only keep essential post data for analysis
+            post_data_entry = {
+                "content": content,
+                "score": likes,
+                "created": post_date.timestamp() if post_date else 0
+            }
+            
+            user_data[username]['posts'].append(post_data_entry)
+            user_data[username]['total_posts'] += 1
+            user_data[username]['total_score'] += likes
+            
+            # Update user dates
+            if post_date:
+                if user_data[username]['first_post_date'] is None:
+                    user_data[username]['first_post_date'] = post_date.isoformat()
+                    user_data[username]['last_post_date'] = post_date.isoformat()
+                else:
+                    if post_date < datetime.datetime.fromisoformat(user_data[username]['first_post_date']):
+                        user_data[username]['first_post_date'] = post_date.isoformat()
+                    if post_date > datetime.datetime.fromisoformat(user_data[username]['last_post_date']):
+                        user_data[username]['last_post_date'] = post_date.isoformat()
+            
+            # Handle replies
+            replied_to_account_id = post.get('in_reply_to_account_id')
+            if replied_to_account_id:
+                if post.get('in_reply_to'):
+                    replied_username = (post['in_reply_to'].get('account', {}).get('username') or 
+                                      post['in_reply_to'].get('username') or 
+                                      post['in_reply_to'].get('author', {}).get('username'))
+                    if not replied_username:
+                        replied_username = f"user_{replied_to_account_id}"
+                else:
+                    replied_username = f"user_{replied_to_account_id}"
+                
+                if (replied_username and 
+                    replied_username != username and
+                    replied_username != 'None' and 
+                    replied_username != '[deleted]'):
+                    
+                    if replied_username not in graph:
+                        graph.add_node(replied_username, subNum=0)
+                    
+                    if graph.has_edge(username, replied_username):
+                        graph[username][replied_username]['replyNum'] += 1
+                    else:
+                        graph.add_edge(username, replied_username, replyNum=1)
+        
+        # Get comments for this post if it has replies
+        replies_count = post.get('replies_count', 0) or 0
+        if replies_count > 0:
+            post_id = post.get('id')
+            if post_id:
+                # Call comment API
+                comment_input_data = {
+                    "postId": post_id,
+                    "maxPosts": 50,
+                    "sortBy": "trending",
+                    "cleanContent": True,
+                    "proxyConfiguration": {
+                        "useApifyProxy": True,
+                        "apifyProxyGroups": ["RESIDENTIAL"]
+                    }
+                }
+                
+                try:
+                    comment_response = requests.post(
+                        f"https://api.apify.com/v2/acts/muhammetakkurtt~truthsocial-comment-scraper/runs?token={api_token}",
+                        json=comment_input_data,
+                        headers={'Content-Type': 'application/json'},
+                        timeout=60
+                    )
+                    
+                    if comment_response.status_code == 201:
+                        comment_run_info = comment_response.json()
+                        comment_run_id = comment_run_info['data']['id']
+                        
+                        # Wait for comment run to complete
+                        comment_start_time = time.time()
+                        comment_timeout = 300
+                        
+                        while time.time() - comment_start_time < comment_timeout:
+                            comment_status_response = requests.get(
+                                f"https://api.apify.com/v2/actor-runs/{comment_run_id}?token={api_token}",
+                                timeout=30
+                            )
+                            
+                            if comment_status_response.status_code == 200:
+                                comment_status_data = comment_status_response.json()
+                                comment_status = comment_status_data['data']['status']
+                                
+                                if comment_status == 'SUCCEEDED':
+                                    break
+                                elif comment_status in ['FAILED', 'ABORTED', 'TIMED-OUT']:
+                                    break
+                                
+                        time.sleep(5)
+                else:
+                                time.sleep(5)
+                        
+                        # Get comment results
+                        if comment_status == 'SUCCEEDED':
+                            comment_results_response = requests.get(
+                                f"https://api.apify.com/v2/datasets/{comment_run_info['data']['defaultDatasetId']}/items?token={api_token}",
+                                timeout=60
+                            )
+                            
+                            if comment_results_response.status_code == 200:
+                                comments = comment_results_response.json()
+                                
+                                for comment in comments:
+                                    # Extract comment author name
+                                    comment_username = (comment.get('account', {}).get('username') or 
+                                                      comment.get('username') or 
+                                                      comment.get('author', {}).get('username'))
+                                    
+                                    if not comment_username:
+                                        comment_account_id = (comment.get('account', {}).get('id') or 
+                                                           comment.get('account_id') or 
+                                                           comment.get('id'))
+                                        if comment_account_id:
+                                            comment_username = f"user_{comment_account_id}"
+                                        else:
+                                            comment_username = "unknown_user"
+                                    
+                                    # Check if valid comment author
+                                    if (comment_username and 
+                                        comment_username != 'None' and 
+                                        comment_username != '[deleted]'):
+                                        
+                                        comment_content = comment.get('content', '') or comment.get('text', '')
+                                        comment_created_at = comment.get('created_at', '')
+                                        comment_likes = int(comment.get('favourites_count', 0) or 0)
+                                        
+                                        # Parse comment date
+                                        comment_post_date = None
+                                        if comment_created_at:
+                                            try:
+                                                comment_post_date = datetime.datetime.fromisoformat(comment_created_at.replace('Z', '+00:00'))
+                                            except:
+                                                pass
+                                        
+                                        # Only keep essential comment data for analysis
+                                        comment_data_entry = {
+                                            "content": comment_content,
+                                            "score": comment_likes,
+                                            "created": comment_post_date.timestamp() if comment_post_date else 0
+                                        }
+                                        
+                                        user_data[comment_username]['posts'].append(comment_data_entry)
+                                        user_data[comment_username]['total_posts'] += 1
+                                        user_data[comment_username]['total_score'] += comment_likes
+                                        
+                                        # Update user dates for comment author
+                                        if comment_post_date:
+                                            if user_data[comment_username]['first_post_date'] is None:
+                                                user_data[comment_username]['first_post_date'] = comment_post_date.isoformat()
+                                                user_data[comment_username]['last_post_date'] = comment_post_date.isoformat()
+                                            else:
+                                                if comment_post_date < datetime.datetime.fromisoformat(user_data[comment_username]['first_post_date']):
+                                                    user_data[comment_username]['first_post_date'] = comment_post_date.isoformat()
+                                                if comment_post_date > datetime.datetime.fromisoformat(user_data[comment_username]['last_post_date']):
+                                                    user_data[comment_username]['last_post_date'] = comment_post_date.isoformat()
+                                        
+                                        # Add or update graph node for comment author
+                                        if comment_username not in graph:
+                                            graph.add_node(comment_username, subNum=0)
+                                        
+                                        # Handle comment reply relationships
+                                        comment_replied_to_account_id = comment.get('in_reply_to_account_id')
+                                        if comment_replied_to_account_id:
+                                            if comment.get('in_reply_to'):
+                                                comment_replied_username = (comment['in_reply_to'].get('account', {}).get('username') or 
+                                                                          comment['in_reply_to'].get('username') or 
+                                                                          comment['in_reply_to'].get('author', {}).get('username'))
+                                                if not comment_replied_username:
+                                                    comment_replied_username = f"user_{comment_replied_to_account_id}"
+                                            else:
+                                                comment_replied_username = f"user_{comment_replied_to_account_id}"
+                                            
+                                            if (comment_replied_username and 
+                                                comment_replied_username != comment_username and
+                                                comment_replied_username != 'None' and 
+                                                comment_replied_username != '[deleted]'):
+                                                
+                                                if comment_replied_username not in graph:
+                                                    graph.add_node(comment_replied_username, subNum=0)
+                                                
+                                                if graph.has_edge(comment_username, comment_replied_username):
+                                                    graph[comment_username][comment_replied_username]['replyNum'] += 1
+                                                else:
+                                                    graph.add_edge(comment_username, comment_replied_username, replyNum=1)
+                        
+                        time.sleep(5)  # Rate limiting
+                
+                except Exception as e:
+                    pass
     
-    # Show final summary
-    print(f"\n=== FINAL DATA COLLECTION SUMMARY ===")
-    print(f"Search terms used: {', '.join(search_terms)}")
-    print(f"Total posts collected: {len(all_posts_with_replies)}")
-    print(f"Unique post IDs: {len(processed_post_ids)}")
-    print(f"Unique users found: {len(user_data_dict)}")
-    print(f"Network nodes: {len(graph.nodes())}")
-    print(f"Network edges: {len(graph.edges())}")
-    print(f"Reply relationships: {reply_edges}")
-    print(f"Mention relationships: {mention_edges}")
-    print(f"Files saved: {sFileName}, {user_posts_file}")
-    print(f"====================================\n")
+    # Save graph
+    try:
+        graph_file = "truthsocial.graphml"
+        nx.write_graphml(graph, graph_file)
+    except Exception as e:
+            pass
+    
+    # Save user data
+    user_data_dict = dict(user_data)
+    
+    with open("truthsocial.json", "w", encoding="utf-8") as f:
+        json.dump(user_data_dict, f, indent=2, ensure_ascii=False)
+
 
 if __name__ == "__main__":
-    main()
+    main() 

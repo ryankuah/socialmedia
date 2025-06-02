@@ -1,21 +1,15 @@
 import networkx as nx
-import matplotlib.pyplot as plt
 import json
 import datetime
 from collections import defaultdict
 from redditClient import redditClient
 
-
 def main():
-    sFileName = "reddit.graphml"
-    user_posts_file = "reddit.json"
-    
+    graph_file = "reddit.graphml"
+    json_file = "reddit.json"
     client = redditClient()
-    
-    replyGraph = nx.DiGraph()
-    
-    dSubCommentId = dict()
-    
+    reply_graph = nx.DiGraph()
+    submission_comment_mapping = dict()
     user_data = defaultdict(lambda: {
         'submissions': [],
         'comments': [],
@@ -24,29 +18,19 @@ def main():
         'first_post_date': None,
         'last_post_date': None
     })
-    
     subreddit = client.subreddit('UkrainianConflict')
-    
-    submissions_processed = 0
-    
     for submission in subreddit.hot(limit=1000):
-        submissions_processed += 1
-        
         submission_author_name = str(submission.author) if submission.author else None
         if (submission_author_name and 
             submission_author_name != 'None' and 
             submission_author_name != '[deleted]' and 
             submission_author_name != 'AutoModerator'):
-            
-            if submission.author.name in replyGraph:
-                replyGraph.nodes[submission.author.name]['subNum'] += 1
+            if submission.author.name in reply_graph:
+                reply_graph.nodes[submission.author.name]['subNum'] += 1
             else:
-                replyGraph.add_node(submission.author.name, subNum=1)
-            
-            submissionId = submission.name
-            dSubCommentId[submissionId] = {submissionId : submission.author.name}
-
-        
+                reply_graph.add_node(submission.author.name, subNum=1)
+            submission_id = submission.name
+            submission_comment_mapping[submission_id] = {submission_id : submission.author.name}
         submission_author = str(submission.author)
         if (submission_author != 'None' and 
             submission_author != '[deleted]' and 
@@ -61,11 +45,9 @@ def main():
                 "num_comments": submission.num_comments,
                 "upvote_ratio": submission.upvote_ratio if hasattr(submission, 'upvote_ratio') else None
             }
-            
             user_data[submission_author]['submissions'].append(submission_data)
             user_data[submission_author]['total_posts'] += 1
             user_data[submission_author]['total_score'] += submission.score
-            
             post_date = datetime.datetime.fromtimestamp(submission.created_utc)
             if user_data[submission_author]['first_post_date'] is None:
                 user_data[submission_author]['first_post_date'] = post_date.isoformat()
@@ -75,16 +57,12 @@ def main():
                     user_data[submission_author]['first_post_date'] = post_date.isoformat()
                 if post_date > datetime.datetime.fromisoformat(user_data[submission_author]['last_post_date']):
                     user_data[submission_author]['last_post_date'] = post_date.isoformat()
-        
         submission.comments.replace_more(limit=None)
         for comment in submission.comments.list():
-            
             comment_author_name = str(comment.author) if comment.author else None
             if (comment.author is not None and 
                 comment_author_name != 'AutoModerator'):
-                
-                dSubCommentId[submissionId].update({comment.name : comment.author.name})
-                
+                submission_comment_mapping[submission_id].update({comment.name : comment.author.name})
                 comment_author = str(comment.author)
                 if (comment_author != 'None' and 
                     comment_author != '[deleted]' and 
@@ -98,11 +76,9 @@ def main():
                         "parent_submission_author": str(submission.author),
                         "is_submitter": comment.is_submitter if hasattr(comment, 'is_submitter') else False
                     }
-                    
                     user_data[comment_author]['comments'].append(comment_data)
                     user_data[comment_author]['total_posts'] += 1
                     user_data[comment_author]['total_score'] += comment.score
-                    
                     post_date = datetime.datetime.fromtimestamp(comment.created_utc)
                     if user_data[comment_author]['first_post_date'] is None:
                         user_data[comment_author]['first_post_date'] = post_date.isoformat()
@@ -112,26 +88,17 @@ def main():
                             user_data[comment_author]['first_post_date'] = post_date.isoformat()
                         if post_date > datetime.datetime.fromisoformat(user_data[comment_author]['last_post_date']):
                             user_data[comment_author]['last_post_date'] = post_date.isoformat()
-                
-                if comment.parent_id in dSubCommentId[submissionId]:
-                    if replyGraph.has_edge(comment.author.name, dSubCommentId[submissionId][comment.parent_id]):
-                        replyGraph[comment.author.name][dSubCommentId[submissionId][comment.parent_id]]['replyNum'] += 1
+                if comment.parent_id in submission_comment_mapping[submission_id]:
+                    if reply_graph.has_edge(comment.author.name, submission_comment_mapping[submission_id][comment.parent_id]):
+                        reply_graph[comment.author.name][submission_comment_mapping[submission_id][comment.parent_id]]['replyNum'] += 1
                     else:
-                        if not comment.author.name in replyGraph:
-                            replyGraph.add_node(comment.author.name, subNum=0)
-                        
-                        if not dSubCommentId[submissionId][comment.parent_id] in replyGraph:
-                            replyGraph.add_node(dSubCommentId[submissionId][comment.parent_id], subNum=0)
-                        
-                        replyGraph.add_edge(comment.author.name, dSubCommentId[submissionId][comment.parent_id], replyNum=1)
-        
-        if submissions_processed % 10 == 0:
-            pass
-    
-    nx.readwrite.write_graphml(replyGraph, sFileName)
-    
+                        if not comment.author.name in reply_graph:
+                            reply_graph.add_node(comment.author.name, subNum=0)
+                        if not submission_comment_mapping[submission_id][comment.parent_id] in reply_graph:
+                            reply_graph.add_node(submission_comment_mapping[submission_id][comment.parent_id], subNum=0)
+                        reply_graph.add_edge(comment.author.name, submission_comment_mapping[submission_id][comment.parent_id], replyNum=1)
+    nx.readwrite.write_graphml(reply_graph, graph_file)
     user_data_dict = dict(user_data)
-    
     summary_stats = {
         'total_users': len(user_data_dict),
         'total_submissions': sum(len(user['submissions']) for user in user_data_dict.values()),
@@ -139,12 +106,10 @@ def main():
         'collection_date': datetime.datetime.now().isoformat(),
         'subreddit': subreddit.display_name
     }
-    
     final_data = {
         'summary': summary_stats,
         'users': user_data_dict
     }
-    
-    with open(user_posts_file, "w", encoding="utf-8") as json_file:
-        json.dump(final_data, json_file, indent=2, ensure_ascii=False)
+    with open(json_file, "w", encoding="utf-8") as f:
+        json.dump(final_data, f, indent=2, ensure_ascii=False)
     
