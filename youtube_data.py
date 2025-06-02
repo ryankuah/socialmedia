@@ -8,7 +8,7 @@ from googleapiclient.errors import HttpError
 import networkx as nx
 
 def main():
-    api_key = "AIzaSyCNu6lT5xh2-qTO88q7SrCdIX45zqfLVNM"
+    api_key = ""
     
     graph_file = "youtube.graphml"
     json_file = "youtube.json"
